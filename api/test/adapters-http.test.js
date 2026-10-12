@@ -132,9 +132,68 @@ test('compatible: a base that already names its API version is used as the full 
   }
 });
 
+test('compatible: a mount whose API has no version segment is reached on the 404 fallback and remembered (#508)', async () => {
+  // The issue's repro: an OpenAI-shaped mount (Open WebUI's /openai) that 404s anything with /v1.
+  const { createServer } = await import('node:http');
+  const hits = [];
+  const server = createServer((req, res) => {
+    const url = req.url.split('?')[0];
+    hits.push(req.method + ' ' + url);
+    const send = (status, o) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
+    if (url === '/openai/models') return send(200, { object: 'list', data: [{ id: 'a-local-model', object: 'model' }] });
+    if (url === '/openai/chat/completions' && req.method === 'POST') {
+      req.resume();
+      return req.on('end', () => send(200, { object: 'chat.completion', choices: [{ index: 0, message: { role: 'assistant', content: ANSWER }, finish_reason: 'stop' }] }));
+    }
+    req.resume();
+    return send(404, { detail: 'Not Found' });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const base = `http://127.0.0.1:${server.address().port}/openai`;
+    const cfg = { provider: 'compatible', providerOptions: { compatible: { baseUrl: validateBaseUrl(base).value } } };
+    const m = await compatible.models(cfg, env);
+    assert.deepEqual(m, { ok: true, models: ['a-local-model'] });
+    const r = await compatible.invoke({ cfg, env, model: 'a-local-model', prompt: 'ping', maxTokens: 64 });
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.text, ANSWER);
+    // The first call of all tried /v1, every later one went straight to the form that answered.
+    assert.deepEqual(hits, ['GET /openai/v1/models', 'GET /openai/models', 'POST /openai/chat/completions']);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('compatible: the 404 fallback keeps the first error when neither form answers, and never touches other providers (#508)', async () => {
+  // Ollama answers an unknown model with a 404 of its own; that message must survive the retry.
+  const f = fakeFetch(n => (n === 1
+    ? { status: 404, body: { error: { message: 'model "nope" not found, try pulling it first' } } }
+    : { status: 404, body: '404 page not found' }));
+  const r = await compatible.invoke({ cfg: cfgCompat, prompt: 'P', env: {}, model: 'nope', fetch: f });
+  assert.deepEqual(f.calls.map(c => c.url), ['http://ollama.lan:11434/v1/chat/completions', 'http://ollama.lan:11434/chat/completions']);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /^404 model "nope" not found/);
+  // …and a failed fallback teaches nothing: the next request still starts at /v1.
+  const g = fakeFetch([ok({ data: [] })]);
+  await compatible.models(cfgCompat, {}, { fetch: g });
+  assert.equal(g.calls[0].url, 'http://ollama.lan:11434/v1/models');
+
+  // A base that carries its version has only one form, so a 404 there is final.
+  const v = fakeFetch([{ status: 404, body: { error: 'nope' } }]);
+  await compatible.invoke({ cfg: { provider: 'compatible', providerOptions: { compatible: { baseUrl: 'https://openrouter.ai/api/v1' } } }, prompt: 'P', env: {}, model: 'm', fetch: v });
+  assert.equal(v.calls.length, 1);
+
+  // OpenAI itself always lives at /v1; a 404 there is a real answer, not a missing prefix.
+  const o = fakeFetch([{ status: 404, body: { error: { message: 'The model `x` does not exist' } } }]);
+  const ro = await openai.invoke({ cfg: {}, prompt: 'P', env, model: 'x', fetch: o });
+  assert.equal(o.calls.length, 1);
+  assert.match(ro.stderr, /^404 The model/);
+});
+
 test('compatible: models and check try a version-less mount once after an appended /v1 returns 404 (#508)', async () => {
-  const cfg = { providerOptions: { compatible: { baseUrl: 'http://gw.lan/openai/', headers: { 'x-gateway': 'test' } } } };
   for (const method of ['models', 'check']) {
+    const base = `http://gw.lan/${method}`;
+    const cfg = { providerOptions: { compatible: { baseUrl: base + '/', headers: { 'x-gateway': 'test' } } } };
     const f = fakeFetch([
       { status: 404, body: { detail: 'Not Found' } },
       ok({ data: [{ id: 'local-model' }] })
@@ -142,7 +201,7 @@ test('compatible: models and check try a version-less mount once after an append
     const r = await compatible[method](cfg, env, { fetch: f });
     assert.equal(r.ok, true, method);
     assert.deepEqual(r.models, ['local-model'], method);
-    assert.deepEqual(f.calls.map(c => c.url), ['http://gw.lan/openai/v1/models', 'http://gw.lan/openai/models'], method);
+    assert.deepEqual(f.calls.map(c => c.url), [base + '/v1/models', base + '/models'], method);
     assert.equal(f.calls[0].method, 'GET');
     assert.deepEqual(f.calls[1].headers, f.calls[0].headers);
     assert.equal(f.calls[1].headers.authorization, 'Bearer compat-1');
@@ -202,7 +261,7 @@ test('compatible: the version-less fallback is only for 404; other HTTP provider
 });
 
 test('compatible: JSON-mode degradation stays on the working version-less route', async () => {
-  const cfg = { providerOptions: { compatible: { baseUrl: 'http://gw.lan/openai' } } };
+  const cfg = { providerOptions: { compatible: { baseUrl: 'http://json-mode.lan/openai' } } };
   const f = fakeFetch([
     { status: 404, body: 'not found' },
     { status: 400, body: { error: { message: 'response_format is not supported' } } },
@@ -210,10 +269,28 @@ test('compatible: JSON-mode degradation stays on the working version-less route'
   ]);
   const r = await compatible.invoke({ cfg, env, model: 'm', prompt: 'P', fetch: f });
   assert.equal(r.code, 0);
-  assert.deepEqual(f.calls.map(c => c.url), ['http://gw.lan/openai/v1/chat/completions',
-    'http://gw.lan/openai/chat/completions', 'http://gw.lan/openai/chat/completions']);
+  assert.deepEqual(f.calls.map(c => c.url), ['http://json-mode.lan/openai/v1/chat/completions',
+    'http://json-mode.lan/openai/chat/completions', 'http://json-mode.lan/openai/chat/completions']);
   assert.deepEqual(f.calls[1].body, f.calls[0].body);
   assert.ok(!('response_format' in f.calls[2].body));
+});
+
+test('compatible: transient retries stay on the version-less route without changing the request', async () => {
+  for (const status of [429, 503]) {
+    const baseUrl = `http://retry-${status}.lan/openai`;
+    const cfg = { providerOptions: { compatible: { baseUrl } } };
+    const f = fakeFetch([
+      { status: 404, body: 'not found' },
+      { status, body: { error: { message: 'try again' } } },
+      ok({ choices: [{ message: { content: ANSWER }, finish_reason: 'stop' }] })
+    ]);
+    const r = await compatible.invoke({ cfg, env, model: 'm', prompt: 'P', fetch: f, retryDelayMs: 0 });
+    assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(f.calls.map(c => c.url), [baseUrl + '/v1/chat/completions',
+      baseUrl + '/chat/completions', baseUrl + '/chat/completions']);
+    assert.deepEqual(f.calls[1].body, f.calls[0].body);
+    assert.deepEqual(f.calls[2].body, f.calls[0].body);
+  }
 });
 
 test('compatible: no endpoint configured, or no model chosen, is a clean failure rather than a request', async () => {
